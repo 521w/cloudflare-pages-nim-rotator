@@ -1,19 +1,29 @@
 // functions/v1/chat/completions.js
 // Cloudflare Pages Function · OpenAI 兼容 chat completions endpoint
-// 多 key 轮换 · 撞限记冷却到 KV
+// 多 key 轮换 · 撞限记冷却到 KV · 写统计到另一个 KV namespace (NIM_STATS)
+
+function todayUTC() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
+}
+
+async function recordStat(env, key, delta = 1) {
+  if (!env.NIM_STATS) return; // 没绑就跳过
+  const k = `stats:${todayUTC()}:${key}`;
+  const cur = Number((await env.NIM_STATS.get(k)) || 0);
+  await env.NIM_STATS.put(k, String(cur + delta), { expirationTtl: 60 * 60 * 24 * 14 }); // 14 天存活
+}
+
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  // 校验 authorization · 简单挡门外人薅羊毛
-  const expected = env.PROXY_AUTH || 'anything';
-  const got = request.headers.get('Authorization') || '';
-  if (got !== `Bearer ${expected}` && got !== expected) {
-    // 允许 Claude Code 不带 token · 仅对 attached /v1/models 加严
-    // 这里默认开闸,生产可改严
-  }
-
-  // 拉 NIM keys (KV namespace NIM_KEYS · 多个 key 命名 key:1 key:2 key:3)
   let body;
   try {
     body = await request.json();
@@ -21,21 +31,26 @@ export async function onRequestPost(context) {
     return jsonResponse({ error: { message: 'invalid json body' } }, 400);
   }
 
+  // 拉 NIM keys
   const list = await env.NIM_KEYS.list({ prefix: 'key:' });
   const candidates = [];
   const now = Date.now();
   for (const k of list.keys) {
     const v = await env.NIM_KEYS.get(k.name, { type: 'json' });
-    if (v && (!v.cooldownUntil || v.cooldownUntil < now)) {
-      candidates.push({ name: k.name, value: v.value });
-    }
+    if (!v) continue;
+    if (v.active === false) continue; // disabled
+    if (v.cooldownUntil && v.cooldownUntil > now) continue;
+    candidates.push({ name: k.name, value: v.value });
   }
 
   if (candidates.length === 0) {
-    return jsonResponse({ error: { message: 'all keys cooling down' } }, 503);
+    await recordStat(env, 'total');
+    await recordStat(env, 'fail');
+    await recordStat(env, 'status:503');
+    return jsonResponse({ error: { message: 'all keys cooling down or disabled' } }, 503);
   }
 
-  // 随机选一条 · 多 key 均摊 · 等价 round-robin
+  // 随机选一条
   const chosen = candidates[Math.floor(Math.random() * candidates.length)];
 
   // 透传到 NVIDIA NIM
@@ -50,18 +65,27 @@ export async function onRequestPost(context) {
       body: JSON.stringify(body),
     });
   } catch (e) {
+    await recordStat(env, 'total');
+    await recordStat(env, 'fail');
+    await recordStat(env, 'status:502');
     return jsonResponse({ error: { message: 'NIM fetch failed' } }, 502);
   }
 
-  // 撞限处理 · KV 记 cooldownUntil
+  // 撞限处理
+  await recordStat(env, 'total');
+  await recordStat(env, `status:${resp.status}`);
+  await recordStat(env, `key:${chosen.name}`);
+
   if (resp.status === 429 || resp.status === 402) {
     const ra = Number(resp.headers.get('retry-after') || 0);
-    const retryMs = ra > 0 ? ra * 1000 : 5 * 60 * 1000; // 默认 5 分钟
-    await env.NIM_KEYS.put(chosen.name, JSON.stringify({
-      value: chosen.value,
-      cooldownUntil: Date.now() + retryMs,
-      lastFailStatus: resp.status,
-    }));
+    const retryMs = ra > 0 ? ra * 1000 : 5 * 60 * 1000;
+    const v = await env.NIM_KEYS.get(chosen.name, { type: 'json' });
+    v.cooldownUntil = Date.now() + retryMs;
+    v.lastFailStatus = resp.status;
+    v.lastFailAt = Date.now();
+    await env.NIM_KEYS.put(chosen.name, JSON.stringify(v));
+
+    await recordStat(env, 'fail');
     const txt = await resp.text();
     return new Response(txt, {
       status: resp.status,
@@ -70,6 +94,12 @@ export async function onRequestPost(context) {
         'X-Key-Cooling': chosen.name,
       },
     });
+  }
+
+  if (resp.status >= 200 && resp.status < 300) {
+    await recordStat(env, 'ok');
+  } else {
+    await recordStat(env, 'fail');
   }
 
   // 透传
@@ -84,16 +114,8 @@ export async function onRequestPost(context) {
 }
 
 export async function onRequestGet() {
-  // GET 不支持 · 返回方法说明
   return jsonResponse({
     error: { message: 'method not allowed · use POST' },
     hint: 'POST {"model":"meta/llama-3.3-70b-instruct","messages":[...]}',
   }, 405);
-}
-
-function jsonResponse(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
