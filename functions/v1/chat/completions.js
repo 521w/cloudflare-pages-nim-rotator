@@ -14,6 +14,20 @@ async function recordStat(env, key, delta = 1) {
   await env.NIM_STATS.put(k, String(cur + delta), { expirationTtl: 60 * 60 * 24 * 14 }); // 14 天存活
 }
 
+// 把一条调用日志推入 KV 最近 100 条轮转列表
+async function appendLog(env, entry) {
+  if (!env.NIM_STATS) return;
+  const LOG_KEY = 'logs:recent';
+  const MAX = 100;
+  try {
+    const raw = await env.NIM_STATS.get(LOG_KEY, { type: 'json' });
+    const arr = Array.isArray(raw) ? raw : [];
+    arr.unshift(entry);
+    if (arr.length > MAX) arr.length = MAX;
+    await env.NIM_STATS.put(LOG_KEY, JSON.stringify(arr), { expirationTtl: 60 * 60 * 24 * 30 }); // 30 天存活
+  } catch (e) { /* 日志不影响主流程 */ }
+}
+
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
@@ -76,6 +90,15 @@ export async function onRequestPost(context) {
       recordStat(env, 'fail'),
       recordStat(env, 'status:503'),
     ]);
+    await appendLog(env, {
+      ts: Date.now(),
+      model: body?.model || '',
+      status: 503,
+      keyUsed: '',
+      keysTried: 0,
+      latencyMs: Date.now() - now,
+      error: 'no candidates',
+    });
     return jsonResponse({ error: { message: 'all keys cooling down or disabled' } }, 503);
   }
 
@@ -85,8 +108,10 @@ export async function onRequestPost(context) {
 
   let lastResp = null;
   let coolingKey = null;
+  const triedKeys = [];
 
-  for (const chosen of ordered) {
+  for (let idx = 0; idx < ordered.length; idx++) {
+    const chosen = ordered[idx];
     let resp;
     try {
       resp = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
@@ -99,6 +124,7 @@ export async function onRequestPost(context) {
       });
     } catch (e) {
       // 网络错=这把挂了，跳过下一把
+      triedKeys.push(chosen.name);
       await markCooldown(env, chosen.name, COOLDOWN_MIN_MS);
       coolingKey = chosen.name;
       continue;
@@ -113,6 +139,15 @@ export async function onRequestPost(context) {
       await Promise.all(statKeys.map((k) => recordStat(env, k)));
 
       const txt = await resp.text();
+      await appendLog(env, {
+        ts: Date.now(),
+        model: body?.model || '',
+        status: resp.status,
+        keyUsed: chosen.name,
+        keysTried: idx + 1,
+        latencyMs: Date.now() - now,
+        error: resp.status >= 200 && resp.status < 300 ? '' : `status ${resp.status}`,
+      });
       return new Response(txt, {
         status: resp.status,
         headers: {
@@ -124,6 +159,7 @@ export async function onRequestPost(context) {
     }
 
     // 撞限:记冷却、试下一把
+    triedKeys.push(chosen.name);
     const ra = Number(resp.headers.get('retry-after') || 0);
     const retryMs = ra > 0 ? ra * 1000 : COOLDOWN_MIN_MS;
     await markCooldown(env, chosen.name, retryMs);
@@ -142,6 +178,15 @@ export async function onRequestPost(context) {
       recordStat(env, 'all_keys_cooling'),
     ]);
     const txt = await lastResp.text();
+    await appendLog(env, {
+      ts: Date.now(),
+      model: body?.model || '',
+      status: lastResp.status,
+      keyUsed: coolingKey || '',
+      keysTried: triedKeys.length,
+      latencyMs: Date.now() - now,
+      error: `all keys tried: ${triedKeys.join(',')}`,
+    });
     return new Response(txt, {
       status: lastResp.status,
       headers: {
@@ -158,6 +203,15 @@ export async function onRequestPost(context) {
     recordStat(env, 'fail'),
     recordStat(env, 'status:502'),
   ]);
+  await appendLog(env, {
+    ts: Date.now(),
+    model: body?.model || '',
+    status: 502,
+    keyUsed: '',
+    keysTried: triedKeys.length,
+    latencyMs: Date.now() - now,
+    error: `all keys network-failed: ${triedKeys.join(',')}`,
+  });
   return jsonResponse({ error: { message: 'all keys network-failed' } }, 502);
 }
 

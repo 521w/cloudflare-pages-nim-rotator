@@ -64,6 +64,15 @@ const HTML = `<!doctype html>
   .inline-form > div { display: flex; flex-direction: column; gap: 4px; }
   .inline-form label { font-size: 11px; color: var(--muted); }
   .input-lg { width: 460px !important; }
+  /* logs table */
+  .log-row.ok { color: var(--ok); }
+  .log-row.err { color: var(--err); }
+  .log-row.warn { color: var(--warn); }
+  .log-row.muted { color: var(--muted); }
+  .log-table { font-size: 12px; }
+  .log-table td { padding: 6px 10px; }
+  .log-table .err-cell { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-empty { padding: 20px; text-align: center; color: var(--muted); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -188,6 +197,14 @@ async function viewApp() {
       </section>
 
       <section>
+        <div class="row" style="justify-content:space-between;">
+          <h2>调用记录</h2>
+          <button id="refreshLogsBtn">刷新</button>
+        </div>
+        <div id="logsBox">loading...</div>
+      </section>
+
+      <section>
         <h2>每日 添加 shape</h2>
         <div class="muted small">
           输入 <code>key:1</code> 形式 当不输入 ID 会让系统生成。点击 <code>添加</code> 后是新行可被验。点击 <code>验证</code> 可能需要 1-3 秒
@@ -197,11 +214,13 @@ async function viewApp() {
   \`;
 
   document.getElementById('refreshBtn').onclick = () => loadKeys();
+  document.getElementById('refreshLogsBtn').onclick = () => loadLogs();
   document.getElementById('logoutBtn').onclick = () => logout();
   document.getElementById('addBtn').onclick = () => focusAdd();
 
   await loadKeys();
   await loadStats();
+  await loadLogs();
 }
 
 async function logout() {
@@ -303,6 +322,61 @@ async function loadStats() {
     \`;
   } catch (e) {
     box.innerHTML = '<span class="err-msg">统计加载失败 · ' + JSON.stringify(e).slice(0,200) + '</span>';
+  }
+}
+
+async function loadLogs() {
+  const box = document.getElementById('logsBox');
+  if (!box) return;
+  try {
+    const r = await jget('/logs?limit=50');
+    const logs = r.logs || [];
+    if (logs.length === 0) {
+      box.innerHTML = '<div class="log-empty">还没有调用记录。发几个请求后刷新就能看到。</div>';
+      return;
+    }
+    const rows = logs.map((l) => {
+      const isOk = l.status >= 200 && l.status < 300;
+      const cls = isOk ? 'ok' : (l.status >= 500 ? 'err' : (l.status >= 400 ? 'warn' : 'muted'));
+      const statusPill = isOk
+        ? '<span class="pill ok">' + l.status + '</span>'
+        : l.status >= 500
+          ? '<span class="pill err">' + l.status + '</span>'
+          : '<span class="pill cool">' + l.status + '</span>';
+      const errCell = l.error ? '<code class="small err-cell" title="' + l.error.replace(/"/g,'') + '">' + l.error.slice(0,60) + (l.error.length > 60 ? '…' : '') + '</code>' : '<span class="muted">—</span>';
+      const keyShort = (l.keyUsed || '').replace(/^key:/, '');
+      return \`
+        <tr class="log-row \${cls}">
+          <td class="muted small">\${l.tsFmt || ''}</td>
+          <td><code class="small">\${(l.model || '').slice(0,40)}</code></td>
+          <td>\${statusPill}</td>
+          <td class="small">\${keyShort || '—'}</td>
+          <td class="num small">\${l.keysTried || 0}</td>
+          <td class="num small">\${l.latencyMs || 0}ms</td>
+          <td>\${errCell}</td>
+        </tr>
+      \`;
+    }).join('');
+    box.innerHTML = \`
+      <table class="log-table">
+        <thead>
+          <tr>
+            <th>时间 (UTC)</th>
+            <th>模型</th>
+            <th>状态</th>
+            <th>用 key</th>
+            <th>试了几把</th>
+            <th>耗时</th>
+            <th>错误</th>
+          </tr>
+        </thead>
+        <tbody>\${rows}</tbody>
+      </table>
+      <div class="muted small" style="margin-top:8px;">显示最近 \${logs.length} 条 · 最多保留 100 条</div>
+    \`;
+  } catch (e) {
+    if (e && e.status === 401) { viewLogin('session expired'); return; }
+    box.innerHTML = '<span class="err-msg">日志加载失败 · ' + JSON.stringify(e).slice(0,200) + '</span>';
   }
 }
 
