@@ -1,7 +1,6 @@
 // functions/admin/api/stats.js
-// GET /admin/api/stats
-// Reads aggregated counters from KV: stats:YYYY-MM-DD:total, stats:YYYY-MM-DD:byKey:[id], stats:YYYY-MM-DD:byStatus:[code]
-// Returns last 7 days + today.
+// GET /admin/api/stats            — aggregated counters (last 7 days)
+// GET /admin/api/stats?logs=N     — recent call logs (max 100, default 50)
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -41,8 +40,38 @@ async function readBucket(env, prefix) {
   return out;
 }
 
+function fmtTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
+}
+
+async function handleLogs(env, request) {
+  const url = new URL(request.url);
+  const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get('logs') || '50', 10)));
+  if (!env.NIM_STATS) return json({ ok: true, logs: [] });
+  const raw = await env.NIM_STATS.get('logs:recent', { type: 'json' });
+  let arr = Array.isArray(raw) ? raw : [];
+  arr = arr.slice(0, limit);
+  const logs = arr.map((e) => ({ ...e, tsFmt: fmtTs(e.ts) }));
+  return json({ ok: true, count: logs.length, logs });
+}
+
 export async function onRequestGet(context) {
-  const { env } = context;
+  const { env, request } = context;
+  const url = new URL(request.url);
+
+  // logs mode: /admin/api/stats?logs=N
+  if (url.searchParams.has('logs')) {
+    try {
+      return await handleLogs(env, request);
+    } catch (e) {
+      return json({ ok: false, error: String(e) }, 500);
+    }
+  }
+
+  // default: stats mode
   try {
     const ds = days(7);
     const series = [];

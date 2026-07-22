@@ -329,7 +329,7 @@ async function loadLogs() {
   const box = document.getElementById('logsBox');
   if (!box) return;
   try {
-    const r = await jget('/logs?limit=50');
+    const r = await jget('/stats?logs=50');
     const logs = r.logs || [];
     if (logs.length === 0) {
       box.innerHTML = '<div class="log-empty">还没有调用记录。发几个请求后刷新就能看到。</div>';
