@@ -83,7 +83,7 @@ export async function onRequestGet(context) {
       const byKey = await readBucket(env, `stats:${day}:key:`);
       series.push({ day, total, ok, fail, byStatus, byKey });
     }
-    return json({ ok: true, today: today(), series });
+    return json({ ok: true, today: today(), series, _v: 'logs_merged_v2' });
   } catch (e) {
     return json({ ok: false, error: String(e) }, 500);
   }
