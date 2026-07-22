@@ -41,17 +41,18 @@ export async function onRequest(context) {
   // Static assets (login page, panel HTML) skip auth for GET
   const path = url.pathname;
 
-  // All /admin/api/* require auth via cookie
+  // /admin/api/login and /admin/api/logout don't need auth (login sets the cookie)
+  if (path === '/admin/api/login' || path === '/admin/api/logout') {
+    return next();
+  }
+
+  // All other /admin/api/* require auth via cookie
   if (path.startsWith('/admin/api/')) {
     if (!(await isAuthed(request, env))) {
       return new Response(JSON.stringify({ error: 'unauthorized' }), {
         status: 401,
         headers: { 'Content-Type': 'application/json' },
       });
-    }
-    // POST/PUT/DELETE on /admin/api/login are allowed (no auth needed)
-    if (path === '/admin/api/login' || path === '/admin/api/logout') {
-      return next();
     }
     return next();
   }
